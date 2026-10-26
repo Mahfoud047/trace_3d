@@ -1,8 +1,11 @@
 import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter/material.dart';
+import 'package:gal/gal.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
 import 'map_html.dart';
@@ -49,6 +52,13 @@ class _MapPageState extends State<MapPage> {
   bool _pageReady = false;
   bool _flying = false;
   bool _satellite = true;
+  bool _recording = false;
+  int _speed = 1;
+  Color _trackColor = _accent;
+  double _trackWidth = 4.5;
+  bool _bike = true;
+  Color _markerColor = const Color(0xFFEAB308);
+  final _video = BytesBuilder(copy: false);
 
   @override
   void initState() {
@@ -58,11 +68,7 @@ class _MapPageState extends State<MapPage> {
       ..setBackgroundColor(_bg)
       ..addJavaScriptChannel(
         'Bridge',
-        onMessageReceived: (m) {
-          if (m.message == 'flyEnd' && mounted) {
-            setState(() => _flying = false);
-          }
-        },
+        onMessageReceived: (m) => _onBridge(m.message),
       )
       ..setNavigationDelegate(NavigationDelegate(
         onPageFinished: (_) {
@@ -71,6 +77,40 @@ class _MapPageState extends State<MapPage> {
         },
       ))
       ..loadHtmlString(mapHtml, baseUrl: 'https://app.local/');
+  }
+
+  void _onBridge(String msg) {
+    if (!mounted) return;
+    if (msg == 'flyEnd') {
+      setState(() => _flying = _recording = false);
+    } else if (msg == 'encoding') {
+      setState(() => _flying = false);
+      _toast('Encodage de la vidéo…');
+    } else if (msg.startsWith('vchunk:')) {
+      _video.add(base64Decode(msg.substring(7)));
+    } else if (msg.startsWith('vend:')) {
+      _saveVideo(msg.substring(5));
+    } else if (msg.startsWith('verr:')) {
+      _video.clear();
+      setState(() => _flying = _recording = false);
+      _toast(msg.substring(5));
+    }
+  }
+
+  Future<void> _saveVideo(String ext) async {
+    final file = File(
+        '${Directory.systemTemp.path}/trace3d_${DateTime.now().millisecondsSinceEpoch}.$ext');
+    try {
+      await file.writeAsBytes(_video.takeBytes());
+      if (!await Gal.hasAccess()) await Gal.requestAccess();
+      await Gal.putVideo(file.path);
+      _toast('Vidéo enregistrée dans la galerie.');
+    } catch (e) {
+      _toast("Erreur d'enregistrement : $e");
+    } finally {
+      if (file.existsSync()) file.deleteSync();
+      if (mounted) setState(() => _recording = false);
+    }
   }
 
   void _sendTrack() {
@@ -98,7 +138,7 @@ class _MapPageState extends State<MapPage> {
       );
       setState(() {
         _track = track;
-        _flying = false;
+        _flying = _recording = false;
       });
       if (_pageReady) _sendTrack();
     } on FormatException catch (e) {
@@ -112,16 +152,40 @@ class _MapPageState extends State<MapPage> {
     if (_track == null) return;
     if (_flying) {
       _web.runJavaScript('stopFly(true);');
-      setState(() => _flying = false);
+      setState(() => _flying = _recording = false);
     } else {
-      _web.runJavaScript('startFly();');
+      _web.runJavaScript('startFly($_speed, false);');
       setState(() => _flying = true);
     }
   }
 
+  void _recordVideo() {
+    if (_track == null || _flying || _recording) return;
+    _video.clear();
+    _web.runJavaScript('startFly($_speed, true);');
+    setState(() => _flying = _recording = true);
+  }
+
+  String _hex(Color c) =>
+      '#${(c.toARGB32() & 0xFFFFFF).toRadixString(16).padLeft(6, '0')}';
+
+  void _applyStyle() {
+    _web.runJavaScript("setTrackStyle('${_hex(_trackColor)}', $_trackWidth);");
+  }
+
+  void _setMarkerColor(Color c) {
+    setState(() => _markerColor = c);
+    _web.runJavaScript("setMarkerColor('${_hex(c)}');");
+  }
+
+  void _setBike(bool bike) {
+    setState(() => _bike = bike);
+    _web.runJavaScript("setMarker('${bike ? 'bike' : 'circle'}');");
+  }
+
   void _recenter() {
     _web.runJavaScript('recenter();');
-    if (_flying) setState(() => _flying = false);
+    if (_flying || _recording) setState(() => _flying = _recording = false);
   }
 
   void _toggleBase() {
@@ -139,9 +203,22 @@ class _MapPageState extends State<MapPage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      drawer: _settingsDrawer(),
       body: Stack(
         children: [
           Positioned.fill(child: WebViewWidget(controller: _web)),
+          SafeArea(
+            child: Builder(
+              builder: (ctx) => Padding(
+                padding: const EdgeInsets.all(8),
+                child: IconButton.filledTonal(
+                  tooltip: 'Réglages',
+                  onPressed: () => Scaffold.of(ctx).openDrawer(),
+                  icon: const Icon(Icons.menu),
+                ),
+              ),
+            ),
+          ),
           Align(
             alignment: Alignment.bottomCenter,
             child: SafeArea(
@@ -158,6 +235,83 @@ class _MapPageState extends State<MapPage> {
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _settingsDrawer() {
+    const colors = [
+      _accent,
+      Color(0xFFEF4444),
+      Color(0xFFEAB308),
+      Color(0xFF22C55E),
+      Color(0xFF06B6D4),
+      Color(0xFF3B82F6),
+      Color(0xFFA855F7),
+      Color(0xFFEC4899),
+    ];
+    Widget swatches(Color selected, void Function(Color) onPick) => Wrap(
+          spacing: 10,
+          runSpacing: 10,
+          children: [
+            for (final c in colors)
+              GestureDetector(
+                onTap: () => onPick(c),
+                child: CircleAvatar(
+                  radius: 18,
+                  backgroundColor: c,
+                  child: c == selected
+                      ? const Icon(Icons.check, color: Colors.white)
+                      : null,
+                ),
+              ),
+          ],
+        );
+    return Drawer(
+      backgroundColor: _surface,
+      child: SafeArea(
+        child: ListView(
+          padding: const EdgeInsets.all(20),
+          children: [
+            const Text('Réglages',
+                style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700)),
+            const SizedBox(height: 20),
+            const Text('Couleur du tracé', style: TextStyle(color: Colors.white70)),
+            const SizedBox(height: 10),
+            swatches(_trackColor, (c) {
+              setState(() => _trackColor = c);
+              _applyStyle();
+            }),
+            const SizedBox(height: 24),
+            Text('Largeur du tracé : ${_fmt(_trackWidth)} px',
+                style: const TextStyle(color: Colors.white70)),
+            Slider(
+              min: 2,
+              max: 12,
+              divisions: 20,
+              value: _trackWidth,
+              onChanged: (v) => setState(() => _trackWidth = v),
+              onChangeEnd: (_) => _applyStyle(),
+            ),
+            const SizedBox(height: 16),
+            const Text('Repère de navigation', style: TextStyle(color: Colors.white70)),
+            const SizedBox(height: 10),
+            SegmentedButton<bool>(
+              showSelectedIcon: false,
+              segments: const [
+                ButtonSegment(value: false, label: Text('Cercle')),
+                ButtonSegment(value: true, label: Text('Cycliste')),
+              ],
+              selected: {_bike},
+              onSelectionChanged: (v) => _setBike(v.first),
+            ),
+            const SizedBox(height: 20),
+            Text(_bike ? 'Couleur du cycliste' : 'Couleur du cercle',
+                style: const TextStyle(color: Colors.white70)),
+            const SizedBox(height: 10),
+            swatches(_markerColor, _setMarkerColor),
+          ],
+        ),
       ),
     );
   }
@@ -233,6 +387,19 @@ class _MapPageState extends State<MapPage> {
           SizedBox(height: 70, child: _ElevationChart(samples: t.profile())),
         ],
         const SizedBox(height: 12),
+        SegmentedButton<int>(
+          showSelectedIcon: false,
+          style: const ButtonStyle(visualDensity: VisualDensity.compact),
+          segments: [
+            for (final v in const [1, 2, 5, 10, 15])
+              ButtonSegment(value: v, label: Text('x$v')),
+          ],
+          selected: {_speed},
+          onSelectionChanged: _flying || _recording
+              ? null
+              : (v) => setState(() => _speed = v.first),
+        ),
+        const SizedBox(height: 10),
         Row(
           children: [
             Expanded(
@@ -243,6 +410,16 @@ class _MapPageState extends State<MapPage> {
               ),
             ),
             const SizedBox(width: 8),
+            IconButton.filledTonal(
+              tooltip: 'Générer une vidéo (x$_speed)',
+              onPressed: _flying || _recording ? null : _recordVideo,
+              icon: _recording
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2))
+                  : const Icon(Icons.videocam),
+            ),
             IconButton.filledTonal(
               tooltip: 'Recentrer',
               onPressed: _recenter,
