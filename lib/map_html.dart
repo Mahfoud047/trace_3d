@@ -528,13 +528,13 @@ function draw(c) {
   if (map.getSource('track')) {
     map.getSource('track').setData(geo);
   } else {
-    map.addSource('track', { type: 'geojson', data: geo });
+    map.addSource('track', { type: 'geojson', data: geo, lineMetrics: true }); // lineMetrics : dégradé le long de la trace
     map.addLayer({ id: 'track-casing', type: 'line', source: 'track',
       layout: { 'line-cap': 'round', 'line-join': 'round' },
-      paint: { 'line-color': '#ffffff', 'line-width': trackWidth + 3.5, 'line-opacity': 0.9 } });
+      paint: { 'line-gradient': gradientOf('#ffffff'), 'line-width': trackWidth + 3.5, 'line-opacity': 0.9 } });
     map.addLayer({ id: 'track-line', type: 'line', source: 'track',
       layout: { 'line-cap': 'round', 'line-join': 'round' },
-      paint: { 'line-color': trackColor, 'line-width': trackWidth } });
+      paint: { 'line-gradient': gradientOf(trackColor), 'line-width': trackWidth } });
   }
 
   buildCam();
@@ -578,10 +578,47 @@ function fitAll() {
   });
 }
 
+// Pendant le survol la trace se dessine derrière le cycliste : revealAt = fraction (0..1) déjà parcourue, null = tout.
+let revealAt = null, shownAt = -1;
+function gradientOf(col) {
+  const n = parseInt(col.slice(1), 16), clear = `rgba(${n >> 16},${(n >> 8) & 255},${n & 255},0)`;
+  if (revealAt === null || revealAt >= 1) return ['interpolate', ['linear'], ['line-progress'], 0, col, 1, col];
+  if (revealAt <= 0) return ['interpolate', ['linear'], ['line-progress'], 0, clear, 1, clear];
+  return ['interpolate', ['linear'], ['line-progress'], 0, col, revealAt, col, Math.min(1, revealAt + 1e-6), clear, 1, clear];
+}
+
+function paintTrack() {
+  if (!map.getLayer('track-line')) return;
+  map.setPaintProperty('track-line', 'line-gradient', gradientOf(trackColor));
+  map.setPaintProperty('track-casing', 'line-gradient', gradientOf('#ffffff'));
+}
+
+// Fraction (0..1) de la trace réelle déjà parcourue au point p : projection sur la trace brute, qui est plus longue
+// que le chemin lissé de la caméra (bruit GPS), donc d / cam.total prenait du retard. Recherche vers l'avant seulement.
+let ri = 0;
+function trackFrac(p) {
+  const kx = Math.cos(rad(p[1])) * 111320, ky = 110540;
+  let best = Infinity, bi = ri, bu = 0;
+  for (let i = ri; i < coords.length - 1 && cum[i] - cum[ri] < 3000; i++) {
+    const ax = (coords[i][0] - p[0]) * kx, ay = (coords[i][1] - p[1]) * ky;
+    const dx = (coords[i + 1][0] - coords[i][0]) * kx, dy = (coords[i + 1][1] - coords[i][1]) * ky, l2 = dx * dx + dy * dy;
+    const u = l2 ? Math.max(0, Math.min(1, -(ax * dx + ay * dy) / l2)) : 0;
+    const d2 = (ax + u * dx) ** 2 + (ay + u * dy) ** 2;
+    if (d2 < best) { best = d2; bi = i; bu = u; }
+  }
+  ri = bi;
+  return (cum[bi] + bu * (cum[bi + 1] - cum[bi])) / total;
+}
+
+function setReveal(f) {
+  revealAt = f;
+  if (f === null || Math.abs(f - shownAt) > 0.0004) { shownAt = f === null ? -1 : f; paintTrack(); }
+}
+
 function setTrackStyle(color, width) {
   trackColor = color; trackWidth = width;
   if (map.getLayer('track-line')) {
-    map.setPaintProperty('track-line', 'line-color', color);
+    paintTrack();
     map.setPaintProperty('track-line', 'line-width', width);
     map.setPaintProperty('track-casing', 'line-width', width + 3.5);
   }
@@ -788,10 +825,11 @@ function showHud(st) { hudState = st; paintHud(); }
 
 // Après la dernière position : la carte se recadre sur le parcours, les stats finales zooment, puis on arrête.
 function outro() {
-  const ZOOM = 1400, HOLD = 3600;
+  const ZOOM = 1400, HOLD = 9000; // HOLD long : si la vidéo est accélérée, la fin reste lisible
   const fin = hudFinal();
   let last = null, t = 0;
   cityPins = false;
+  setReveal(null);
   fitAll();
   const step = (ts) => {
     if (last === null) last = ts;
@@ -817,14 +855,16 @@ function startFly(speed, record) {
   // ~5 s par km, entre 25 s et 90 s à x1
   const dur = Math.min(90000, Math.max(25000, (total / 1000) * 5000)) / (speed || 1);
   const look = Math.min(400, Math.max(80, total * 0.01)); // m devant le repère pour le cap
-  const SMOOTH = 150, INTRO = record ? 2200 : 1600, TURN_SIDE = 40;                       // lissage du cap (m) ; fondu d'entrée (ms)
+  const SMOOTH = 320, CSMOOTH = 45, INTRO = record ? 2200 : 1600, TURN_SIDE = 45;         // lissage du cap et du centre (m) ; fondu d'entrée (ms)
+  const PITCH = 58, ZOOM = 14.6;                                                         // drone : plus haut, derrière
   let from = { c: map.getCenter(), z: map.getZoom(), p: map.getPitch(), b: map.getBearing() };
-  let last = null, t = 0, tw = 0, brg = null, prevD = 0;
+  let last = null, t = 0, tw = 0, brg = null, prevD = 0, cc = null;
   // vidéo : le cycliste attend au départ, vu de côté, pendant que la caméra zoome sur lui, puis il démarre
   const WAIT = record ? 2800 : 0, ZOOMIN = 1900, p0 = pointAt(0, cam), h0 = bearing(p0, pointAt(Math.min(cam.total, look), cam));
   const WAIT_VIEW = { z: 15.8, p: 62, b: (h0 + 270) % 360 };
 
   map.getSource('pins').setData(pinsGeo(true));
+  setReveal(0); ri = 0;
 
   const step = (ts) => {
     if (last === null) last = ts;
@@ -848,17 +888,20 @@ function startFly(speed, record) {
     if (t >= dur) { if (record && hudData) outro(); else finishFly(); return; }
     const d = (t / dur) * cam.total;
     const p = pointAt(d, cam);
+    setReveal(trackFrac(p));
     const target = bearing(p, pointAt(Math.min(cam.total, d + look), cam));
     // lissage selon la distance parcourue : même rendu quelle que soit la vitesse ou la fréquence d'images
     brg = brg === null ? target : lerpAngle(brg, target, 1 - Math.exp(-(d - prevD) / SMOOTH));
+    // le centre de la caméra suit le cycliste avec du retard (drone) : il ne reprend pas chaque détail du tracé
+    cc = cc === null ? p : [lerp(cc[0], p[0], 1 - Math.exp(-(d - prevD) / CSMOOTH)), lerp(cc[1], p[1], 1 - Math.exp(-(d - prevD) / CSMOOTH))];
     prevD = d;
     const k = Math.min(1, t / INTRO), e = k * k * (3 - 2 * k); // fondu depuis la vue actuelle
     const cb = lerpAngle(from.b, brg, e); // cap réel de la caméra
     map.jumpTo({
-      center: [lerp(from.c.lng, p[0], e), lerp(from.c.lat, p[1], e)],
+      center: [lerp(from.c.lng, cc[0], e), lerp(from.c.lat, cc[1], e)],
       bearing: cb,
-      pitch: lerp(from.p, 68, e),
-      zoom: lerp(from.z, 14.8, e)
+      pitch: lerp(from.p, PITCH, e),
+      zoom: lerp(from.z, ZOOM, e)
     });
     // virage serré : la caméra n'est pas encore derrière le cycliste, on le montre de profil
     const rel = angDiff(bearing(p, pointAt(Math.min(cam.total, d + 15), cam)), cb);
@@ -877,6 +920,7 @@ function stopFly(silent, keepCities = false) {
   if (anim) { cancelAnimationFrame(anim); anim = null; }
   if (rec) { rec.discard = true; if (rec.state !== 'inactive') rec.stop(); }
   hudState = null; if (!keepCities) { shown = new Map(); cityPins = true; } paintHud();
+  setReveal(null);
   if (coords.length) {
     map.getSource('pins')?.setData(pinsGeo(false));
     placeDot(coords[0], 0);
