@@ -10,21 +10,18 @@ Application mobile (Android + iOS) qui lit un fichier **GPX** ou **TCX** et affi
 ## Installation
 
 ```bash
-# 1. Crée un projet Flutter vierge (génère les dossiers android/ et ios/)
-flutter create --project-name trace_3d trace_3d
-
-# 2. Copie par-dessus les fichiers de ce dossier
-cp -r lib trace_3d/
-cp pubspec.yaml trace_3d/
-cp -r sample trace_3d/
-
-# 3. Lance
+git clone https://github.com/Mahfoud047/trace_3d.git
 cd trace_3d
 flutter pub get
-flutter run
+flutter run            # ou: flutter run -d <id>  (voir `flutter devices`)
 ```
 
 Si une dépendance pose problème de version : `flutter pub upgrade --major-versions`.
+
+### Android : notes de build
+
+- `android/build.gradle.kts` force `compileSdk` 36 sur les plugins (`file_picker` est compilé en 34 alors que `flutter_plugin_android_lifecycle` exige 36). À retirer quand les plugins seront à jour.
+- Xiaomi / MIUI : activer **Options pour les développeurs → Installer via USB** (et le débogage USB), sinon l'installation échoue avec `INSTALL_FAILED_USER_RESTRICTED`.
 
 ### Android : autoriser Internet en release
 
