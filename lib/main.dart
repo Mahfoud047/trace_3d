@@ -116,7 +116,8 @@ class _MapPageState extends State<MapPage> {
   void _sendTrack() {
     final t = _track;
     if (t == null) return;
-    _web.runJavaScript('loadTrack(${jsonEncode(t.toCoordinates())});');
+    _web.runJavaScript(
+        'loadTrack(${jsonEncode(t.toCoordinates())}, ${jsonEncode(t.hudSeries())});');
   }
 
   Future<void> _openFile() async {
@@ -219,21 +220,37 @@ class _MapPageState extends State<MapPage> {
               ),
             ),
           ),
-          Align(
-            alignment: Alignment.bottomCenter,
-            child: SafeArea(
-              top: false,
-              child: Container(
-                margin: const EdgeInsets.all(12),
-                padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(
-                  color: _surface.withAlpha(235),
-                  borderRadius: BorderRadius.circular(22),
+          // Pendant l'enregistrement, la carte et les stats restent seules à l'écran.
+          if (_recording && _flying)
+            SafeArea(
+              child: Align(
+                alignment: Alignment.topRight,
+                child: Padding(
+                  padding: const EdgeInsets.all(8),
+                  child: IconButton.filled(
+                    tooltip: "Arrêter l'enregistrement",
+                    onPressed: _toggleFly,
+                    icon: const Icon(Icons.stop),
+                  ),
                 ),
-                child: _track == null ? _emptyPanel() : _trackPanel(_track!),
+              ),
+            )
+          else
+            Align(
+              alignment: Alignment.bottomCenter,
+              child: SafeArea(
+                top: false,
+                child: Container(
+                  margin: const EdgeInsets.all(12),
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: _surface.withAlpha(235),
+                    borderRadius: BorderRadius.circular(22),
+                  ),
+                  child: _track == null ? _emptyPanel() : _trackPanel(_track!),
+                ),
               ),
             ),
-          ),
         ],
       ),
     );

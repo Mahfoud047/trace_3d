@@ -12,6 +12,9 @@ class TrackPoint {
   final DateTime? time;
 }
 
+/// Seuil d'hystérésis (m) pour le dénivelé : limite le bruit GPS.
+const _gainThresholdM = 3.0;
+
 double _rad(double d) => d * math.pi / 180.0;
 
 /// Distance entre deux points GPS, en mètres.
@@ -89,7 +92,7 @@ class Track {
     final sm = _smoothElevations(pts);
     double? gain, loss, minE, maxE;
     if (sm != null) {
-      const threshold = 3.0; // mètres
+      const threshold = _gainThresholdM;
       var g = 0.0;
       var l = 0.0;
       var ref = sm[0];
@@ -204,15 +207,67 @@ class Track {
   }
 
   /// Coordonnées [lon, lat, alt] envoyées à la carte (décimées si trop nombreuses).
-  List<List<double>> toCoordinates({int maxPoints = 5000}) {
+  List<List<double>> toCoordinates({int maxPoints = 5000}) =>
+      [for (final i in _indices(maxPoints)) _coord(i)];
+
+  /// Indices des points envoyés à la carte (décimation régulière, dernier point inclus).
+  List<int> _indices(int maxPoints) {
     final n = points.length;
     final step = (n / maxPoints).ceil().clamp(1, n);
-    final out = <List<double>>[];
-    for (var i = 0; i < n; i += step) {
-      out.add(_coord(i));
+    return [
+      for (var i = 0; i < n; i += step) i,
+      if ((n - 1) % step != 0) n - 1,
+    ];
+  }
+
+  /// Séries pour l'affichage pendant la vidéo, aux mêmes indices que [toCoordinates] :
+  /// distance cumulée (m), altitude (m), dénivelé positif cumulé (m) et vitesse (km/h, lissée sur ~10 s).
+  Map<String, Object?> hudSeries({int maxPoints = 5000}) {
+    final n = points.length;
+    final idx = _indices(maxPoints);
+    double r1(double v) => double.parse(v.toStringAsFixed(1));
+
+    final gain = List<double>.filled(n, 0);
+    final sm = smoothEle;
+    if (sm != null) {
+      var g = 0.0, ref = sm[0];
+      for (var i = 1; i < n; i++) {
+        final d = sm[i] - ref;
+        if (d >= _gainThresholdM) {
+          g += d;
+          ref = sm[i];
+        } else if (d <= -_gainThresholdM) {
+          ref = sm[i];
+        }
+        gain[i] = g;
+      }
     }
-    if ((n - 1) % step != 0) out.add(_coord(n - 1));
-    return out;
+
+    List<double>? speed;
+    if (points.every((p) => p.time != null)) {
+      final t = [for (final p in points) p.time!.millisecondsSinceEpoch / 1000.0];
+      speed = List<double>.filled(n, 0);
+      var lo = 0, hi = 0;
+      for (var i = 0; i < n; i++) {
+        while (lo < i && t[i] - t[lo] > 5) {
+          lo++;
+        }
+        if (hi < i) hi = i;
+        while (hi < n - 1 && t[hi] - t[i] < 5) {
+          hi++;
+        }
+        final dt = t[hi] - t[lo];
+        speed[i] = dt > 0 ? (cumDistM[hi] - cumDistM[lo]) / dt * 3.6 : 0;
+      }
+    }
+
+    return {
+      'd': [for (final i in idx) r1(cumDistM[i])],
+      'g': sm == null ? null : [for (final i in idx) r1(gain[i])],
+      'e': sm == null ? null : [for (final i in idx) r1(sm[i])],
+      'v': speed == null ? null : [for (final i in idx) r1(speed[i])],
+      'avg': stats.avgSpeedKmh == null ? null : r1(stats.avgSpeedKmh!),
+    };
   }
 
   List<double> _coord(int i) {

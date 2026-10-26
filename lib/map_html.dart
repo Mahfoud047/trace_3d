@@ -12,10 +12,12 @@ const String mapHtml = r'''
 <style>
   html, body, #map { margin: 0; padding: 0; height: 100%; width: 100%; background: #0e1116; }
   .maplibregl-ctrl-attrib { font-size: 10px; }
+  #hud { position: fixed; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; }
 </style>
 </head>
 <body>
 <div id="map"></div>
+<canvas id="hud"></canvas>
 <script src="https://unpkg.com/maplibre-gl@5/dist/maplibre-gl.js"></script>
 <script src="https://unpkg.com/three@0.158.0/build/three.min.js"></script>
 <script>
@@ -33,6 +35,7 @@ const CONFIG = {
 
 let loaded = false, pending = null;
 let coords = [], cum = [], total = 0;
+let hudData = null, hudState = null;
 let anim = null, rec = null, cam = null, lastP = null, frameK = -1, bikeColor = null;
 let trackColor = '#fc4c02', trackWidth = 4.5, markerKind = 'bike', markerColor = '#eab308';
 
@@ -336,7 +339,17 @@ function pinImage(color) {
 }
 
 // ---------- API appelée depuis Flutter ----------
-function loadTrack(c) {
+// h : séries par point { d: distance cumulée (m), e: altitude (m), g: dénivelé + cumulé (m), v: vitesse (km/h), avg }
+function loadTrack(c, h) {
+  hudData = h || null;
+  if (hudData && hudData.e) {                       // profil réduit à ~200 points, y normalisé de 0 à 1
+    const n = hudData.e.length, step = Math.max(1, Math.ceil(n / 200));
+    const lo = Math.min(...hudData.e), span = (Math.max(...hudData.e) - lo) || 1, tot = hudData.d[n - 1] || 1;
+    const prof = { x: [], y: [] };
+    for (let i = 0; i < n; i += step) { prof.x.push(hudData.d[i] / tot); prof.y.push((hudData.e[i] - lo) / span); }
+    if ((n - 1) % step) { prof.x.push(1); prof.y.push((hudData.e[n - 1] - lo) / span); }
+    hudData.prof = prof;
+  }
   if (!loaded) { pending = c; return; }
   draw(c);
 }
@@ -387,6 +400,10 @@ function pinsGeo(showStart) {
 function recenter() {
   if (!coords.length) return;
   stopFly(true);
+  fitAll();
+}
+
+function fitAll() {
   const b = new maplibregl.LngLatBounds([coords[0][0], coords[0][1]], [coords[0][0], coords[0][1]]);
   coords.forEach(p => b.extend([p[0], p[1]]));
   map.fitBounds(b, {
@@ -443,7 +460,7 @@ function placeDot(p, k) {
     }
     if (!map.getLayer('dot')) {
       map.addLayer({ id: 'dot', type: 'symbol', source: 'dot', layout: {
-        'icon-image': 'bike' + k, 'icon-anchor': 'bottom', 'icon-size': 0.85,
+        'icon-image': 'bike' + k, 'icon-anchor': 'bottom', 'icon-size': 0.6,
         'icon-allow-overlap': true, 'icon-ignore-placement': true } });
       frameK = k;
     } else if (frameK !== k) {
@@ -461,6 +478,123 @@ function placeDot(p, k) {
 function refreshDot() {
   removeDot();
   if (lastP) placeDot(lastP, 0);
+}
+
+// ---------- Statistiques affichées pendant la vidéo ----------
+const fmtN = (v, dec) => v.toFixed(dec).replace('.', ',');
+const clamp01 = k => Math.max(0, Math.min(1, k));
+const easeOutBack = k => 1 + 2.2 * Math.pow(k - 1, 3) + 1.2 * Math.pow(k - 1, 2);
+
+// Valeurs au point situé à la fraction f (0..1) de la trace, interpolées entre deux points.
+function hudAt(f) {
+  const h = hudData, n = coords.length;
+  const dd = f * total;
+  let lo = 0, hi = n - 1;
+  while (hi - lo > 1) { const m = (lo + hi) >> 1; if (cum[m] <= dd) lo = m; else hi = m; }
+  const u = clamp01((dd - cum[lo]) / ((cum[hi] - cum[lo]) || 1));
+  const at = a => a ? a[lo] + (a[hi] - a[lo]) * u : null;
+  const dist = at(h.d);
+  return { dist, speed: at(h.v), gain: at(h.g), prog: dist / (h.d[n - 1] || 1), final: 0 };
+}
+
+function hudFinal() {
+  const h = hudData, last = coords.length - 1;
+  return { dist: h.d[last], speed: h.avg, gain: h.g ? h.g[last] : null, prog: 1, final: 0 };
+}
+
+// Profil d'altitude : tracé complet estompé, partie déjà parcourue (jusqu'à prog) remplie, point à la position courante.
+function drawProfile(g, x, y, w, h, prog, u) {
+  const P = hudData && hudData.prof;
+  if (!P) return;
+  const px = i => x + P.x[i] * w, py = i => y + h - (0.1 + 0.8 * P.y[i]) * h;
+  const trace = () => { g.beginPath(); g.moveTo(px(0), py(0)); for (let i = 1; i < P.x.length; i++) g.lineTo(px(i), py(i)); };
+  const area = () => { trace(); g.lineTo(px(P.x.length - 1), y + h); g.lineTo(px(0), y + h); g.closePath(); };
+  g.save();
+  g.lineJoin = 'round'; g.lineWidth = 1.6 * u;
+  area(); g.fillStyle = 'rgba(255,255,255,.14)'; g.fill();
+  trace(); g.strokeStyle = 'rgba(255,255,255,.4)'; g.stroke();
+  g.beginPath(); g.rect(x - 2 * u, y - 6 * u, prog * w + 2 * u, h + 12 * u); g.clip();
+  area(); g.fillStyle = trackColor; g.globalAlpha = .75; g.fill(); g.globalAlpha = 1;
+  trace(); g.strokeStyle = '#fff'; g.lineWidth = 2 * u; g.stroke();
+  g.restore();
+  let i = 1; while (i < P.x.length - 1 && P.x[i] < prog) i++;
+  const k = clamp01((prog - P.x[i - 1]) / ((P.x[i] - P.x[i - 1]) || 1));
+  const cy = py(i - 1) + (py(i) - py(i - 1)) * k;
+  g.beginPath(); g.arc(x + prog * w, cy, 3.6 * u, 0, 2 * Math.PI);
+  g.fillStyle = '#fff'; g.fill(); g.lineWidth = 2 * u; g.strokeStyle = trackColor; g.stroke();
+}
+
+// Dessine les stats sur g (w x h px) : barre translucide en bas, puis carte centrale qui « zoome » à la fin.
+function drawHud(g, w, h, s) {
+  const u = w / 360, fin = clamp01(s.final);
+  const rr = (x, y, ww, hh, r) => { g.beginPath(); g.roundRect(x, y, ww, hh, r); };
+  const metric = (label, value, unit, x, y, big) => {
+    g.textAlign = 'left'; g.textBaseline = 'alphabetic';
+    g.font = `700 ${(big ? 12 : 9.5) * u}px system-ui, Roboto, sans-serif`;
+    g.fillStyle = 'rgba(255,255,255,.72)'; g.fillText(label, x, y);
+    g.font = `800 ${(big ? 46 : 22) * u}px system-ui, Roboto, sans-serif`;
+    g.fillStyle = '#fff'; g.fillText(value, x, y + (big ? 46 : 24) * u);
+    const vw = g.measureText(value).width;
+    g.font = `600 ${(big ? 20 : 11) * u}px system-ui, Roboto, sans-serif`;
+    g.fillStyle = 'rgba(255,255,255,.75)'; g.fillText(' ' + unit, x + vw, y + (big ? 46 : 24) * u);
+  };
+  const items = (final) => [
+    ['DISTANCE', s.dist == null ? '—' : fmtN(s.dist / 1000, 2), 'km'],
+    [final ? 'VITESSE MOYENNE' : 'VITESSE', s.speed == null ? '—' : fmtN(s.speed, 1), 'km/h'],
+    ['DÉNIVELÉ +', s.gain == null ? '—' : String(Math.round(s.gain)), 'm'],
+  ];
+
+  if (fin < 0.4) {                                   // barre du bas, presque transparente
+    g.save(); g.globalAlpha = 1 - fin / 0.4;
+    const prof = !!(hudData && hudData.prof), off = prof ? 38 * u : 0;
+    const bw = w - 24 * u, bh = 58 * u + off, bx = 12 * u, by = h - 28 * u - bh;
+    rr(bx, by, bw, bh, 16 * u); g.fillStyle = 'rgba(12,15,20,.42)'; g.fill();
+    if (prof) drawProfile(g, bx + 14 * u, by + 10 * u, bw - 28 * u, 28 * u, s.prog, u);
+    items(false).forEach((it, i) => metric(it[0], it[1], it[2], bx + 14 * u + i * (bw - 14 * u) / 3, by + 19 * u + off, false));
+    g.restore();
+  }
+  if (fin > 0) {                                     // carte finale : zoom + fondu
+    const e = easeOutBack(fin), sc = 0.55 + 0.45 * e;
+    const prof = !!(hudData && hudData.prof);
+    const cw = w * 0.84, ch = (292 + (prof ? 84 : 0)) * u;
+    g.save(); g.globalAlpha = clamp01(fin * 2);
+    g.translate(w / 2, h * 0.66); g.scale(sc, sc);
+    rr(-cw / 2, -ch / 2, cw, ch, 26 * u); g.fillStyle = 'rgba(12,15,20,.5)'; g.fill();
+    items(true).forEach((it, i) => metric(it[0], it[1], it[2], -cw / 2 + 24 * u, -ch / 2 + 32 * u + i * 90 * u, true));
+    if (prof) drawProfile(g, -cw / 2 + 24 * u, ch / 2 - 24 * u - 56 * u, cw - 48 * u, 56 * u, 1, u);
+    g.restore();
+  }
+}
+
+const hudCv = document.getElementById('hud');
+function paintHud() {
+  const dpr = window.devicePixelRatio || 1, w = window.innerWidth, h = window.innerHeight;
+  if (hudCv.width !== Math.round(w * dpr) || hudCv.height !== Math.round(h * dpr)) {
+    hudCv.width = Math.round(w * dpr); hudCv.height = Math.round(h * dpr);
+  }
+  const g = hudCv.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  if (hudState) drawHud(g, w, h, hudState);
+}
+
+function showHud(st) { hudState = st; paintHud(); }
+
+// Après la dernière position : la carte se recadre sur le parcours, les stats finales zooment, puis on arrête.
+function outro() {
+  const ZOOM = 1400, HOLD = 3600;
+  const fin = hudFinal();
+  let last = null, t = 0;
+  fitAll();
+  const step = (ts) => {
+    if (last === null) last = ts;
+    t += Math.min(ts - last, 40); last = ts;
+    showHud(Object.assign({}, fin, { final: t / ZOOM }));
+    map.triggerRepaint(); // le canvas enregistré doit continuer à recevoir des images
+    if (t >= HOLD) { finishFly(false); return; }
+    anim = requestAnimationFrame(step);
+  };
+  anim = requestAnimationFrame(step);
 }
 
 // ---------- Survol 3D ----------
@@ -486,7 +620,7 @@ function startFly(speed, record) {
     if (last === null) last = ts;
     t += Math.min(ts - last, 40); // un à-coup de rendu ralentit le film au lieu de le faire sauter
     last = ts;
-    if (t >= dur) { finishFly(); return; }
+    if (t >= dur) { if (record && hudData) outro(); else finishFly(); return; }
     const d = (t / dur) * cam.total;
     const p = pointAt(d, cam);
     const target = bearing(p, pointAt(Math.min(cam.total, d + look), cam));
@@ -501,6 +635,7 @@ function startFly(speed, record) {
       zoom: lerp(from.z, 14.8, e)
     });
     placeDot(p, Math.floor(t / 70) % BIKE_FRAMES); // un tour de pédale ≈ 0,84 s
+    if (record && hudData) showHud(hudAt(t / dur));
     anim = requestAnimationFrame(step);
   };
   anim = requestAnimationFrame(step);
@@ -509,6 +644,7 @@ function startFly(speed, record) {
 function stopFly(silent) {
   if (anim) { cancelAnimationFrame(anim); anim = null; }
   if (rec) { rec.discard = true; if (rec.state !== 'inactive') rec.stop(); }
+  hudState = null; paintHud();
   if (coords.length) {
     map.getSource('pins')?.setData(pinsGeo(false));
     placeDot(coords[0], 0);
@@ -516,13 +652,13 @@ function stopFly(silent) {
   if (!silent && window.Bridge) Bridge.postMessage('flyEnd');
 }
 
-function finishFly() {
+function finishFly(fit = true) {
   const r = rec;
   rec = null; // détaché pour que stopFly ne l'annule pas
   stopFly(true);
   if (r) { Bridge.postMessage('encoding'); r.stop(); }
   else if (window.Bridge) Bridge.postMessage('flyEnd');
-  recenter();
+  if (fit) fitAll();
 }
 
 // ---------- Enregistrement vidéo ----------
@@ -537,7 +673,10 @@ function startRec() {
   out.width = Math.floor(src.width * sc / 2) * 2;
   out.height = Math.floor(src.height * sc / 2) * 2;
   const g = out.getContext('2d');
-  const draw = () => g.drawImage(src, 0, 0, out.width, out.height);
+  const draw = () => {
+    g.drawImage(src, 0, 0, out.width, out.height);
+    if (hudState) drawHud(g, out.width, out.height, hudState);
+  };
   map.on('render', draw);
   const r = new MediaRecorder(out.captureStream(30), { mimeType: mime, videoBitsPerSecond: 6000000 });
   r.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
