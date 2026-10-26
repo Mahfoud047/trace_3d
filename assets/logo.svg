@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <filter id="sh" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="18" stdDeviation="22" flood-color="#000" flood-opacity=".35"/>
+    </filter>
+    <linearGradient id="arrow" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ff7a3d"/>
+      <stop offset="1" stop-color="#e8420a"/>
+    </linearGradient>
+  </defs>
+
+  <!-- plan : fond, parc, rivière, rues -->
+  <rect width="1024" height="1024" fill="#eef0e8"/>
+  <path d="M-20 640 C140 600 260 700 330 860 L380 1044 L-20 1044 Z" fill="#cfe5c3"/>
+  <path d="M700 -20 L1044 -20 L1044 330 C930 300 840 220 800 130 C780 80 750 30 700 -20 Z" fill="#cfe5c3"/>
+  <path d="M-20 330 C180 290 330 420 520 380 C720 340 860 460 1044 430" fill="none" stroke="#a8d2f0" stroke-width="86" stroke-linecap="round"/>
+
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <g stroke="#d6d8d0" stroke-width="46">
+      <path d="M180 -20 L180 1044"/><path d="M-20 560 L1044 560"/><path d="M860 -20 L860 1044"/>
+      <path d="M-20 120 L1044 120"/><path d="M520 -20 L520 1044"/><path d="M-20 920 L1044 760"/>
+    </g>
+    <g stroke="#ffffff" stroke-width="34">
+      <path d="M180 -20 L180 1044"/><path d="M-20 560 L1044 560"/><path d="M860 -20 L860 1044"/>
+      <path d="M-20 120 L1044 120"/><path d="M520 -20 L520 1044"/><path d="M-20 920 L1044 760"/>
+    </g>
+    <path d="M-20 780 C200 760 360 640 520 560 S820 420 1044 220" stroke="#f1c36a" stroke-width="30"/>
+  </g>
+
+  <!-- tête de flèche : mouvement / navigation -->
+  <g transform="rotate(32 512 540)" filter="url(#sh)">
+    <path d="M512 190 L770 800 L512 650 L254 800 Z" fill="url(#arrow)" stroke="#ffffff" stroke-width="34" stroke-linejoin="round"/>
+    <path d="M512 190 L512 650 L254 800 Z" fill="#000" opacity=".12"/>
+  </g>
+</svg>
