@@ -14,6 +14,8 @@ dependencies:
   xml: ^6.5.0
   fl_chart: ^0.69.0
   gal: ^2.3.3
+  package_info_plus: ^8.0.0
+  shared_preferences: ^2.3.0
 
 dev_dependencies:
   flutter_test:

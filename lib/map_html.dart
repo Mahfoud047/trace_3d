@@ -8,7 +8,7 @@ const String mapHtml = r'''
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<link href="https://unpkg.com/maplibre-gl@5/dist/maplibre-gl.css" rel="stylesheet">
+<link href="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.css" rel="stylesheet">
 <style>
   html, body, #map { margin: 0; padding: 0; height: 100%; width: 100%; background: #0e1116; }
   .maplibregl-ctrl-attrib { font-size: 10px; }
@@ -18,7 +18,7 @@ const String mapHtml = r'''
 <body>
 <div id="map"></div>
 <canvas id="hud"></canvas>
-<script src="https://unpkg.com/maplibre-gl@5/dist/maplibre-gl.js"></script>
+<script src="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.js"></script>
 <script src="https://unpkg.com/three@0.158.0/build/three.min.js"></script>
 <script>
 // ---------- CONFIG : remplace par tes propres sources si besoin ----------
@@ -33,11 +33,12 @@ const CONFIG = {
 };
 // ------------------------------------------------------------------------
 
-let loaded = false, pending = null;
+let loaded = false, pending = null, pendingSettings = null;
 let coords = [], cum = [], total = 0;
 let hudData = null, hudState = null;
 let cities = [], cityToken = 0, shown = new Map(), cityPins = true; // cityPins : repère 3D affiché (sinon le nom seul)
-let anim = null, rec = null, cam = null, lastP = null, frameK = '', bikeColor = null;
+let anim = null, rec = null, cam = null, lastP = null, frameK = '', bikeKey = '', bikeFr = null;
+let bikeCols = { helmet: '#f7f8fa', top: '#eab308', bottom: '#27324f', bike: '#eab308' }; // casque, haut, bas, vélo
 let trackColor = '#fc4c02', trackWidth = 4.5, markerKind = 'bike', markerColor = '#eab308';
 
 const map = new maplibregl.Map({
@@ -75,6 +76,7 @@ map.on('load', () => {
     });
   } catch (e) { /* ciel non supporté : sans conséquence */ }
   loaded = true;
+  if (pendingSettings) { applySettings(pendingSettings); pendingSettings = null; }
   if (pending) { draw(pending); pending = null; }
 });
 
@@ -153,7 +155,7 @@ function ik(T, root, target, l1, l2, pole) {
   return root.clone().addScaledVector(dir, along).addScaledVector(perp, h);
 }
 
-function bikeFrames(color) {
+function bikeFrames(cols) {
   const T = THREE, W = 400, H = 560, SW = 560, SH = 440;
   const renderer = new T.WebGLRenderer({ alpha: true, antialias: true, preserveDrawingBuffer: true });
   renderer.setSize(W, H, false);
@@ -173,10 +175,10 @@ function bikeFrames(color) {
   sideCam.lookAt(0, 0.8, 0.1);
 
   const mat = (c, extra) => new T.MeshStandardMaterial(Object.assign({ color: c, roughness: 0.55, metalness: 0.04 }, extra));
-  const base = new T.Color(color);
-  const jersey = mat(base, { side: T.DoubleSide, roughness: 0.7 }), frameM = mat(base.clone().multiplyScalar(0.85));
-  const helmetM = mat('#f7f8fa', { roughness: 0.35 }), helmetStripe = mat(base);
-  const shorts = mat('#27324f', { side: T.DoubleSide }), skin = mat('#f1b392'), shoe = mat('#f4f4f5'), glove = mat('#1b1b1f');
+  const base = new T.Color(cols.top);
+  const jersey = mat(base, { side: T.DoubleSide, roughness: 0.7 }), frameM = mat(new T.Color(cols.bike).multiplyScalar(0.85));
+  const helmetM = mat(cols.helmet, { roughness: 0.35 });
+  const shorts = mat(cols.bottom, { side: T.DoubleSide }), skin = mat('#f1b392'), shoe = mat('#f4f4f5'), glove = mat('#1b1b1f');
   const tire = mat('#202124', { roughness: 0.8 }), rimM = mat('#c4cad4', { metalness: 0.7, roughness: 0.35 });
   const dark = mat('#17181b');
 
@@ -187,7 +189,7 @@ function bikeFrames(color) {
     mesh.quaternion.setFromUnitVectors(V(0, 1, 0), d.normalize());
     return mesh;
   };
-  const tube = (g, a, b, r, m) => g.add(orient(new T.Mesh(new T.CylinderGeometry(r, r, a.distanceTo(b), 10), m), a, b));
+  const tube = (g, a, b, r, m) => { r *= m === frameM ? 1.7 : 1; g.add(orient(new T.Mesh(new T.CylinderGeometry(r, r, a.distanceTo(b), 10), m), a, b)); };
   const blob = (g, p, sx, sy, sz, m) => {
     const mesh = new T.Mesh(new T.SphereGeometry(1, 24, 18), m);
     mesh.position.copy(p); mesh.scale.set(sx, sy, sz); g.add(mesh);
@@ -253,7 +255,6 @@ function bikeFrames(color) {
   taper(st, V(0, 1.38, -0.1), V(0, 1.45, -0.22), 0.052, 0.047, skin);
   blob(st, V(0, 1.48, -0.27), 0.095, 0.1, 0.105, skin);
   blob(st, V(0, 1.515, -0.265), 0.118, 0.1, 0.15, helmetM);
-  blob(st, V(0, 1.55, -0.255), 0.032, 0.075, 0.16, helmetStripe);                  // bande de couleur
   [-1, 1].forEach(s => blob(st, V(s * 0.098, 1.46, -0.27), 0.016, 0.026, 0.02, skin));  // oreilles
   // bras vers les cocottes : manche, avant-bras, gant
   [-1, 1].forEach((s, i) => {
@@ -269,12 +270,12 @@ function bikeFrames(color) {
   const oc = out.getContext('2d', { willReadFrequently: true });
   const sc2 = (() => { const c = document.createElement('canvas'); c.width = 280; c.height = 220; return c.getContext('2d', { willReadFrequently: true }); })();
   const silCv = document.createElement('canvas'); silCv.width = 280; silCv.height = 280; const sil = silCv.getContext('2d');
-  // dessine src sur g avec un contour sombre : la silhouette (teintée) décalée dans 12 directions, puis le rendu par-dessus
+  // dessine src sur g avec un contour très fin : la silhouette (teintée) décalée dans 8 directions, puis le rendu par-dessus
   const outline = (g, src, w, h) => {
     sil.globalCompositeOperation = 'source-over'; sil.clearRect(0, 0, 280, 280);
     sil.drawImage(src, 0, 0, w, h);
     sil.globalCompositeOperation = 'source-in'; sil.fillStyle = '#10131a'; sil.fillRect(0, 0, w, h);
-    for (let n = 0; n < 12; n++) g.drawImage(silCv, 0, 0, w, h, 2.2 * Math.cos(n * Math.PI / 6), 2.2 * Math.sin(n * Math.PI / 6), w, h);
+    for (let n = 0; n < 8; n++) g.drawImage(silCv, 0, 0, w, h, Math.cos(n * Math.PI / 4), Math.sin(n * Math.PI / 4), w, h);
     g.drawImage(src, 0, 0, w, h);
   };
   const frames = [], sideR = [], sideL = [];
@@ -284,7 +285,7 @@ function bikeFrames(color) {
 
     for (const z of [0.5, -0.5]) {                       // roues : pneu, jante, rayons
       const w = new T.Group(); w.position.set(0, R, z);
-      const t = new T.Mesh(new T.TorusGeometry(R - 0.024, 0.024, 12, 48), tire); t.rotation.y = Math.PI / 2; w.add(t);
+      const t = new T.Mesh(new T.TorusGeometry(R - 0.036, 0.036, 12, 48), tire); t.rotation.y = Math.PI / 2; w.add(t);
       const r = new T.Mesh(new T.TorusGeometry(R - 0.052, 0.008, 8, 48), rimM); r.rotation.y = Math.PI / 2; w.add(r);
       for (let i = 0; i < 24; i++) {
         const a = i * Math.PI / 12;
@@ -592,6 +593,46 @@ function setMarkerColor(color) {
   refreshDot();
 }
 
+// Réglages enregistrés côté Flutter, appliqués dès que la carte est prête.
+function applySettings(o) {
+  if (!loaded) { pendingSettings = o; return; }
+  trackColor = o.trackColor; trackWidth = o.trackWidth; markerColor = o.markerColor;
+  bikeCols = { helmet: o.helmet, top: o.top, bottom: o.bottom, bike: o.bike };
+  markerKind = o.kind;
+  setBase(o.satellite);
+  refreshDot();
+}
+
+// Génère les images du cycliste si les couleurs ont changé.
+function ensureBike() {
+  const key = JSON.stringify(bikeCols);
+  if (key === bikeKey) return;
+  bikeFr = bikeFrames(bikeCols);
+  for (const [v, list] of [['bike', bikeFr.back], ['bikeR', bikeFr.right], ['bikeL', bikeFr.left]]) {
+    list.forEach((img, i) => {
+      if (map.hasImage(v + i)) map.removeImage(v + i);
+      map.addImage(v + i, img, { pixelRatio: 2 });
+    });
+  }
+  bikeKey = key;
+}
+
+// Couleurs du cycliste choisies dans le menu ; l'aperçu (vue de profil) est renvoyé à Flutter.
+function setBikeColors(helmet, top, bottom, bike) {
+  bikeCols = { helmet, top, bottom, bike };
+  ensureBike();
+  sendBikePreview();
+  refreshDot();
+}
+
+function sendBikePreview() {
+  ensureBike();
+  const img = bikeFr.right[3], c = document.createElement('canvas');
+  c.width = img.width; c.height = img.height;
+  c.getContext('2d').putImageData(img, 0, 0);
+  Bridge.postMessage('bikepv:' + c.toDataURL('image/png').split(',')[1]);
+}
+
 function setMarker(kind) {
   markerKind = kind;
   refreshDot();
@@ -618,16 +659,7 @@ function placeDot(p, k, view = 'bike') {
   if (map.getSource('dot')) map.getSource('dot').setData(f);
   else map.addSource('dot', { type: 'geojson', data: f });
   if (markerKind === 'bike') {
-    if (bikeColor !== markerColor) {
-      const fr = bikeFrames(markerColor);
-      for (const [v, list] of [['bike', fr.back], ['bikeR', fr.right], ['bikeL', fr.left]]) {
-        list.forEach((img, i) => {
-          if (map.hasImage(v + i)) map.removeImage(v + i);
-          map.addImage(v + i, img, { pixelRatio: 2 });
-        });
-      }
-      bikeColor = markerColor;
-    }
+    ensureBike();
     if (!map.getLayer('dot')) {
       map.addLayer({ id: 'dot', type: 'symbol', source: 'dot', layout: {
         'icon-image': view + k, 'icon-anchor': 'bottom', 'icon-size': 0.6,

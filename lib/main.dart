@@ -6,6 +6,8 @@ import 'package:file_picker/file_picker.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter/material.dart';
 import 'package:gal/gal.dart';
+import 'package:package_info_plus/package_info_plus.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
 import 'map_html.dart';
@@ -59,10 +61,22 @@ class _MapPageState extends State<MapPage> {
   bool _bike = true;
   Color _markerColor = const Color(0xFFEAB308);
   final _video = BytesBuilder(copy: false);
+  String _version = '';
+  // couleurs du cycliste : casque, haut, bas, vélo
+  Color _helmet = const Color(0xFFF7F8FA);
+  Color _top = const Color(0xFFEAB308);
+  Color _bottom = const Color(0xFF27324F);
+  Color _bikeCol = const Color(0xFFEAB308);
+  bool _settingsLoaded = false;
+  Uint8List? _preview; // aperçu du cycliste (vue de profil) rendu par la page
 
   @override
   void initState() {
     super.initState();
+    _loadSettings();
+    PackageInfo.fromPlatform().then((i) {
+      if (mounted) setState(() => _version = '${i.version} (${i.buildNumber})');
+    });
     _web = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
       ..setBackgroundColor(_bg)
@@ -73,6 +87,7 @@ class _MapPageState extends State<MapPage> {
       ..setNavigationDelegate(NavigationDelegate(
         onPageFinished: (_) {
           _pageReady = true;
+          if (_settingsLoaded) _pushSettings();
           if (_track != null) _sendTrack();
         },
       ))
@@ -90,6 +105,8 @@ class _MapPageState extends State<MapPage> {
       _video.add(base64Decode(msg.substring(7)));
     } else if (msg.startsWith('vend:')) {
       _saveVideo(msg.substring(5));
+    } else if (msg.startsWith('bikepv:')) {
+      setState(() => _preview = base64Decode(msg.substring(7)));
     } else if (msg.startsWith('verr:')) {
       _video.clear();
       setState(() => _flying = _recording = false);
@@ -170,18 +187,71 @@ class _MapPageState extends State<MapPage> {
   String _hex(Color c) =>
       '#${(c.toARGB32() & 0xFFFFFF).toRadixString(16).padLeft(6, '0')}';
 
-  void _applyStyle() {
+  // Réglages gardés d'une fois sur l'autre (SharedPreferences) : couleurs, largeur, repère, fond, vitesse.
+  Future<void> _loadSettings() async {
+    final p = await SharedPreferences.getInstance();
+    Color col(String k, Color d) => Color(p.getInt(k) ?? d.toARGB32());
+    if (!mounted) return;
+    setState(() {
+      _trackColor = col('trackColor', _trackColor);
+      _trackWidth = p.getDouble('trackWidth') ?? _trackWidth;
+      _bike = p.getBool('bike') ?? _bike;
+      _markerColor = col('markerColor', _markerColor);
+      _helmet = col('helmet', _helmet);
+      _top = col('top', _top);
+      _bottom = col('bottom', _bottom);
+      _bikeCol = col('bikeCol', _bikeCol);
+      _satellite = p.getBool('satellite') ?? _satellite;
+      _speed = p.getInt('speed') ?? _speed;
+      _settingsLoaded = true;
+    });
+    if (_pageReady) _pushSettings();
+  }
+
+  Future<void> _saveSettings() async {
+    final p = await SharedPreferences.getInstance();
+    await p.setInt('trackColor', _trackColor.toARGB32());
+    await p.setDouble('trackWidth', _trackWidth);
+    await p.setBool('bike', _bike);
+    await p.setInt('markerColor', _markerColor.toARGB32());
+    await p.setInt('helmet', _helmet.toARGB32());
+    await p.setInt('top', _top.toARGB32());
+    await p.setInt('bottom', _bottom.toARGB32());
+    await p.setInt('bikeCol', _bikeCol.toARGB32());
+    await p.setBool('satellite', _satellite);
+    await p.setInt('speed', _speed);
+  }
+
+  // Envoie à la page les réglages chargés (page et réglages arrivent dans un ordre quelconque).
+  void _pushSettings() {
+    _web.runJavaScript('applySettings({'
+        "trackColor: '${_hex(_trackColor)}', trackWidth: $_trackWidth, markerColor: '${_hex(_markerColor)}', "
+        "helmet: '${_hex(_helmet)}', top: '${_hex(_top)}', bottom: '${_hex(_bottom)}', bike: '${_hex(_bikeCol)}', "
+        "kind: '${_bike ? 'bike' : 'circle'}', satellite: $_satellite});");
+  }
+
+  void _applyStyle({bool save = true}) {
     _web.runJavaScript("setTrackStyle('${_hex(_trackColor)}', $_trackWidth);");
+    if (save) _saveSettings();
   }
 
   void _setMarkerColor(Color c) {
     setState(() => _markerColor = c);
     _web.runJavaScript("setMarkerColor('${_hex(c)}');");
+    _saveSettings();
   }
 
   void _setBike(bool bike) {
     setState(() => _bike = bike);
     _web.runJavaScript("setMarker('${bike ? 'bike' : 'circle'}');");
+    if (bike) _web.runJavaScript('sendBikePreview();');
+    _saveSettings();
+  }
+
+  void _sendBikeColors() {
+    _web.runJavaScript("setBikeColors('${_hex(_helmet)}', '${_hex(_top)}', "
+        "'${_hex(_bottom)}', '${_hex(_bikeCol)}');");
+    _saveSettings();
   }
 
   void _recenter() {
@@ -192,6 +262,7 @@ class _MapPageState extends State<MapPage> {
   void _toggleBase() {
     setState(() => _satellite = !_satellite);
     _web.runJavaScript('setBase($_satellite);');
+    _saveSettings();
   }
 
   void _toast(String msg) {
@@ -205,6 +276,9 @@ class _MapPageState extends State<MapPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       drawer: _settingsDrawer(),
+      onDrawerChanged: (open) {
+        if (open && _bike && _pageReady) _web.runJavaScript('sendBikePreview();');
+      },
       body: Stack(
         children: [
           Positioned.fill(child: WebViewWidget(controller: _web)),
@@ -267,11 +341,20 @@ class _MapPageState extends State<MapPage> {
       Color(0xFFA855F7),
       Color(0xFFEC4899),
     ];
-    Widget swatches(Color selected, void Function(Color) onPick) => Wrap(
+    const bikeColors = [
+      ...colors,
+      Color(0xFFF7F8FA),
+      Color(0xFF9CA3AF),
+      Color(0xFF27324F),
+      Color(0xFF111827),
+    ];
+    Widget swatches(Color selected, void Function(Color) onPick,
+            [List<Color> palette = colors]) =>
+        Wrap(
           spacing: 10,
           runSpacing: 10,
           children: [
-            for (final c in colors)
+            for (final c in palette)
               GestureDetector(
                 onTap: () => onPick(c),
                 child: CircleAvatar(
@@ -323,10 +406,39 @@ class _MapPageState extends State<MapPage> {
               onSelectionChanged: (v) => _setBike(v.first),
             ),
             const SizedBox(height: 20),
-            Text(_bike ? 'Couleur du cycliste' : 'Couleur du cercle',
-                style: const TextStyle(color: Colors.white70)),
-            const SizedBox(height: 10),
-            swatches(_markerColor, _setMarkerColor),
+            if (_bike) ...[
+              Container(
+                height: 150,
+                decoration: BoxDecoration(
+                  color: Colors.white10,
+                  borderRadius: BorderRadius.circular(14),
+                ),
+                child: _preview == null
+                    ? const Center(child: CircularProgressIndicator(strokeWidth: 2))
+                    : Image.memory(_preview!, fit: BoxFit.contain, gaplessPlayback: true),
+              ),
+              for (final (label, value, set) in <(String, Color, void Function(Color))>[
+                ('Casque', _helmet, (c) => _helmet = c),
+                ('Haut', _top, (c) => _top = c),
+                ('Bas', _bottom, (c) => _bottom = c),
+                ('Vélo', _bikeCol, (c) => _bikeCol = c),
+              ]) ...[
+                const SizedBox(height: 18),
+                Text(label, style: const TextStyle(color: Colors.white70)),
+                const SizedBox(height: 10),
+                swatches(value, (c) {
+                  setState(() => set(c));
+                  _sendBikeColors();
+                }, bikeColors),
+              ],
+            ] else ...[
+              const Text('Couleur du cercle', style: TextStyle(color: Colors.white70)),
+              const SizedBox(height: 10),
+              swatches(_markerColor, _setMarkerColor),
+            ],
+            const SizedBox(height: 32),
+            Text('Trace 3D · version $_version',
+                style: const TextStyle(color: Colors.white38, fontSize: 12)),
           ],
         ),
       ),
@@ -414,7 +526,10 @@ class _MapPageState extends State<MapPage> {
           selected: {_speed},
           onSelectionChanged: _flying || _recording
               ? null
-              : (v) => setState(() => _speed = v.first),
+              : (v) {
+                setState(() => _speed = v.first);
+                _saveSettings();
+              },
         ),
         const SizedBox(height: 10),
         Row(

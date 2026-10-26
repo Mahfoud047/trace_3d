@@ -32,6 +32,10 @@ Application mobile (Android + iOS) qui lit un fichier **GPX** ou **TCX** et affi
 
 ## Installation
 
+**Android sans compiler** : télécharge l'APK de la dernière version dans l'onglet [Releases](https://github.com/Mahfoud047/trace_3d/releases) et ouvre-le sur le téléphone (autoriser l'installation d'applications inconnues). Pour construire l'APK soi-même : `bash tool/build_apk.sh`.
+
+Depuis les sources :
+
 ```bash
 git clone https://github.com/Mahfoud047/trace_3d.git
 cd trace_3d
