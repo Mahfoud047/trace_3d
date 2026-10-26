@@ -8,6 +8,7 @@ import 'package:flutter/material.dart';
 import 'package:gal/gal.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
 import 'map_html.dart';
@@ -68,6 +69,7 @@ class _MapPageState extends State<MapPage> {
   Color _bottom = const Color(0xFF27324F);
   Color _bikeCol = const Color(0xFFEAB308);
   bool _settingsLoaded = false;
+  int? _progress; // avancement de la génération de la vidéo (%)
   Uint8List? _preview; // aperçu du cycliste (vue de profil) rendu par la page
 
   @override
@@ -97,19 +99,29 @@ class _MapPageState extends State<MapPage> {
   void _onBridge(String msg) {
     if (!mounted) return;
     if (msg == 'flyEnd') {
-      setState(() => _flying = _recording = false);
+      WakelockPlus.disable();
+      setState(() {
+        _flying = _recording = false;
+        _progress = null;
+      });
     } else if (msg == 'encoding') {
       setState(() => _flying = false);
       _toast('Encodage de la vidéo…');
     } else if (msg.startsWith('vchunk:')) {
       _video.add(base64Decode(msg.substring(7)));
+    } else if (msg.startsWith('vprog:')) {
+      setState(() => _progress = int.tryParse(msg.substring(6)));
     } else if (msg.startsWith('vend:')) {
       _saveVideo(msg.substring(5));
     } else if (msg.startsWith('bikepv:')) {
       setState(() => _preview = base64Decode(msg.substring(7)));
     } else if (msg.startsWith('verr:')) {
       _video.clear();
-      setState(() => _flying = _recording = false);
+      WakelockPlus.disable();
+      setState(() {
+        _flying = _recording = false;
+        _progress = null;
+      });
       _toast(msg.substring(5));
     }
   }
@@ -126,7 +138,13 @@ class _MapPageState extends State<MapPage> {
       _toast("Erreur d'enregistrement : $e");
     } finally {
       if (file.existsSync()) file.deleteSync();
-      if (mounted) setState(() => _recording = false);
+      WakelockPlus.disable();
+      if (mounted) {
+        setState(() {
+          _recording = false;
+          _progress = null;
+        });
+      }
     }
   }
 
@@ -170,6 +188,7 @@ class _MapPageState extends State<MapPage> {
     if (_track == null) return;
     if (_flying) {
       _web.runJavaScript('stopFly(true);');
+      WakelockPlus.disable();
       setState(() => _flying = _recording = false);
     } else {
       _web.runJavaScript('startFly($_speed, false);');
@@ -180,8 +199,12 @@ class _MapPageState extends State<MapPage> {
   void _recordVideo() {
     if (_track == null || _flying || _recording) return;
     _video.clear();
+    WakelockPlus.enable(); // la génération image par image dure plusieurs minutes : l'écran ne doit pas s'éteindre
     _web.runJavaScript('startFly($_speed, true);');
-    setState(() => _flying = _recording = true);
+    setState(() {
+      _flying = _recording = true;
+      _progress = 0;
+    });
   }
 
   String _hex(Color c) =>
@@ -301,10 +324,25 @@ class _MapPageState extends State<MapPage> {
                 alignment: Alignment.topRight,
                 child: Padding(
                   padding: const EdgeInsets.all(8),
-                  child: IconButton.filled(
-                    tooltip: "Arrêter l'enregistrement",
-                    onPressed: _toggleFly,
-                    icon: const Icon(Icons.stop),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                        decoration: BoxDecoration(
+                          color: _surface.withAlpha(200),
+                          borderRadius: BorderRadius.circular(20),
+                        ),
+                        child: Text('Vidéo ${_progress ?? 0} %',
+                            style: const TextStyle(fontWeight: FontWeight.w600)),
+                      ),
+                      const SizedBox(width: 8),
+                      IconButton.filled(
+                        tooltip: "Arrêter l'enregistrement",
+                        onPressed: _toggleFly,
+                        icon: const Icon(Icons.stop),
+                      ),
+                    ],
                   ),
                 ),
               ),

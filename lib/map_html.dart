@@ -20,6 +20,7 @@ const String mapHtml = r'''
 <canvas id="hud"></canvas>
 <script src="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.js"></script>
 <script src="https://unpkg.com/three@0.158.0/build/three.min.js"></script>
+<script src="https://unpkg.com/mp4-muxer@5.1.3/build/mp4-muxer.js"></script>
 <script>
 // ---------- CONFIG : remplace par tes propres sources si besoin ----------
 const CONFIG = {
@@ -37,12 +38,20 @@ let loaded = false, pending = null, pendingSettings = null;
 let coords = [], cum = [], total = 0;
 let hudData = null, hudState = null;
 let cities = [], cityToken = 0, shown = new Map(), cityPins = true; // cityPins : repère 3D affiché (sinon le nom seul)
+const NAV_RATIO = Math.min(window.devicePixelRatio || 1, 2), FLY_RATIO = Math.min(window.devicePixelRatio || 1, 1.5); // définition de la carte : navigation / survol
+let curRatio = NAV_RATIO;
+const FPS = 30, OUTRO_HOLD = 9000; // images/s de la vidéo ; durée de la carte finale (ms)
+let flyTok = 0;
+// Horloge des animations de villes : virtuelle pendant l'enregistrement image par image, sinon réelle.
+const clockNow = () => (rec && rec.offline ? rec.vt : performance.now());
 let anim = null, rec = null, cam = null, lastP = null, frameK = '', bikeKey = '', bikeFr = null;
 let bikeCols = { helmet: '#f7f8fa', top: '#eab308', bottom: '#27324f', bike: '#eab308' }; // casque, haut, bas, vélo
 let trackColor = '#fc4c02', trackWidth = 4.5, markerKind = 'bike', markerColor = '#eab308';
 
 const map = new maplibregl.Map({
   container: 'map',
+  fadeDuration: 0, // pas de fondu des tuiles ni des symboles : la carte est « au repos » tout de suite (vidéo plus rapide)
+  pixelRatio: Math.min(window.devicePixelRatio || 1, 2), // plafonné : fluidité
   style: {
     version: 8,
     sources: {
@@ -52,9 +61,9 @@ const map = new maplibregl.Map({
       hill: { type: 'raster-dem', tiles: CONFIG.demTiles, tileSize: 256, maxzoom: 15, encoding: 'terrarium' }
     },
     layers: [
-      { id: 'plan', type: 'raster', source: 'plan', layout: { visibility: 'none' } },
-      { id: 'sat',  type: 'raster', source: 'sat' },
-      { id: 'hillshade', type: 'hillshade', source: 'hill',
+      { id: 'plan', type: 'raster', source: 'plan', layout: { visibility: 'none' }, paint: { 'raster-fade-duration': 0 } },
+      { id: 'sat',  type: 'raster', source: 'sat', paint: { 'raster-fade-duration': 0 } },
+      { id: 'hillshade', type: 'hillshade', source: 'hill', layout: { visibility: 'none' },
         paint: { 'hillshade-exaggeration': 0.35, 'hillshade-shadow-color': '#000000' } }
     ]
   },
@@ -364,21 +373,27 @@ function makePinRenderer() {
   cam.position.set(0, 1.0, 6.2); cam.lookAt(0, 0.05, 0);
 
   const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
-  return { renderer, scene, cam, mesh, cv, ctx: cv.getContext('2d'), W, H, key: null };
+  return { renderer, scene, cam, mesh, W, H };
 }
 
-// Image 2D du repère tourné de `ang` radians autour de l'axe vertical.
+// Image 2D du repère tourné de `ang` radians autour de l'axe vertical. Les PIN_ANGLES images sont rendues une seule fois
+// puis le contexte WebGL est libéré : en animation, changer de contexte WebGL à chaque image ralentissait la carte.
+const PIN_ANGLES = 72;
 function pinSprite(ang) {
-  if (!pinGL) pinGL = makePinRenderer();
-  const p = pinGL;
-  if (p.key !== ang) {
-    p.mesh.rotation.y = ang;
-    p.renderer.render(p.scene, p.cam);
-    p.ctx.clearRect(0, 0, p.W, p.H);
-    p.ctx.drawImage(p.renderer.domElement, 0, 0);
-    p.key = ang;
+  if (!pinGL) {
+    const p = makePinRenderer();
+    pinGL = [];
+    for (let i = 0; i < PIN_ANGLES; i++) {
+      p.mesh.rotation.y = 2 * Math.PI * i / PIN_ANGLES;
+      p.renderer.render(p.scene, p.cam);
+      const cv = document.createElement('canvas'); cv.width = p.W; cv.height = p.H;
+      cv.getContext('2d').drawImage(p.renderer.domElement, 0, 0);
+      pinGL.push(cv);
+    }
+    p.renderer.dispose(); p.renderer.forceContextLoss();
   }
-  return p.cv;
+  const k = Math.round((((ang % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI)) / (2 * Math.PI) * PIN_ANGLES) % PIN_ANGLES;
+  return pinGL[k];
 }
 
 // ---------- Villes traversées ----------
@@ -405,6 +420,7 @@ async function loadCities() {
     cities = els.map(el => ({ lon: el.lon, lat: el.lat, place: el.tags.place, name: el.tags['name:fr'] || el.tags.name }))
       .filter(c => coords.some(p => eqDist(p, [c.lon, c.lat]) <= PASS_M[c.place]));
     console.log('villes: ' + cities.length + ' sur la trace (' + cities.map(c => c.name).join(', ') + ')');
+    if (cities.length) setTimeout(() => pinSprite(0), 50); // prépare les images du repère avant le survol
   };
   // Les serveurs Overpass sont souvent saturés : on garde la dernière réponse par zone pour les fois suivantes.
   try { const hit = JSON.parse(localStorage.getItem('villes:' + q)); if (hit) { keep(hit); return; } } catch (_) { /* pas de cache */ }
@@ -430,15 +446,15 @@ async function loadCities() {
 // Fait apparaître les villes dont le centre est à moins de SHOW_M du cycliste ; elles restent ensuite affichées.
 function revealCities(p) {
   for (const c of cities) {
-    if (!shown.has(c) && eqDist(p, [c.lon, c.lat]) <= SHOW_M) shown.set(c, performance.now());
+    if (!shown.has(c) && eqDist(p, [c.lon, c.lat]) <= SHOW_M) shown.set(c, clockNow());
   }
 }
 
 // Repère 3D qui tourne (un tour en 9 s) avec son ombre, et le nom de la ville en gras au-dessus.
 // Dessiné sur g à l'échelle kx (pixels de g par pixel CSS) : sert à l'écran et à la vidéo.
 function drawCities(g, kx) {
-  const now = performance.now();
-  const spr = pinSprite(Math.floor(now / 30) * 30 / 1000 * 2 * Math.PI / 9);
+  const now = clockNow();
+  const spr = cityPins ? pinSprite(now / 1000 * 2 * Math.PI / 9) : null;
   const W = window.innerWidth, H = window.innerHeight;
   for (const [c, t0] of shown) {
     const q = map.project([c.lon, c.lat]);
@@ -528,13 +544,28 @@ function draw(c) {
   if (map.getSource('track')) {
     map.getSource('track').setData(geo);
   } else {
-    map.addSource('track', { type: 'geojson', data: geo, lineMetrics: true }); // lineMetrics : dégradé le long de la trace
+    map.addSource('track', { type: 'geojson', data: geo });
+    map.addSource('trail', { type: 'geojson', data: EMPTY_LINE });
+    map.addSource('tail', { type: 'geojson', data: EMPTY_LINE });
     map.addLayer({ id: 'track-casing', type: 'line', source: 'track',
       layout: { 'line-cap': 'round', 'line-join': 'round' },
-      paint: { 'line-gradient': gradientOf('#ffffff'), 'line-width': trackWidth + 3.5, 'line-opacity': 0.9 } });
+      paint: { 'line-color': '#ffffff', 'line-width': trackWidth + 3.5, 'line-opacity': 0.9 } });
     map.addLayer({ id: 'track-line', type: 'line', source: 'track',
       layout: { 'line-cap': 'round', 'line-join': 'round' },
-      paint: { 'line-gradient': gradientOf(trackColor), 'line-width': trackWidth } });
+      paint: { 'line-color': trackColor, 'line-width': trackWidth } });
+    // même style pour la partie déjà parcourue, affichée à la place de la trace complète pendant le survol
+    map.addLayer({ id: 'trail-casing', type: 'line', source: 'trail',
+      layout: { 'line-cap': 'round', 'line-join': 'round', visibility: 'none' },
+      paint: { 'line-color': '#ffffff', 'line-width': trackWidth + 3.5, 'line-opacity': 0.9 } });
+    map.addLayer({ id: 'tail-casing', type: 'line', source: 'tail',
+      layout: { 'line-cap': 'round', 'line-join': 'round', visibility: 'none' },
+      paint: { 'line-color': '#ffffff', 'line-width': trackWidth + 3.5, 'line-opacity': 0.9 } });
+    map.addLayer({ id: 'trail-line', type: 'line', source: 'trail',
+      layout: { 'line-cap': 'round', 'line-join': 'round', visibility: 'none' },
+      paint: { 'line-color': trackColor, 'line-width': trackWidth } });
+    map.addLayer({ id: 'tail-line', type: 'line', source: 'tail',
+      layout: { 'line-cap': 'round', 'line-join': 'round', visibility: 'none' },
+      paint: { 'line-color': trackColor, 'line-width': trackWidth } });
   }
 
   buildCam();
@@ -569,34 +600,37 @@ function recenter() {
   fitAll();
 }
 
-function fitAll() {
+const fitPadding = () => ({ top: 80, bottom: Math.round(window.innerHeight * 0.42), left: 40, right: 40 });
+function trackBounds() {
   const b = new maplibregl.LngLatBounds([coords[0][0], coords[0][1]], [coords[0][0], coords[0][1]]);
   coords.forEach(p => b.extend([p[0], p[1]]));
-  map.fitBounds(b, {
-    padding: { top: 80, bottom: Math.round(window.innerHeight * 0.42), left: 40, right: 40 },
-    pitch: 60, bearing: -15, duration: 2200, maxZoom: 16
-  });
+  return b;
 }
 
-// Pendant le survol la trace se dessine derrière le cycliste : revealAt = fraction (0..1) déjà parcourue, null = tout.
-let revealAt = null, shownAt = -1;
-function gradientOf(col) {
-  const n = parseInt(col.slice(1), 16), clear = `rgba(${n >> 16},${(n >> 8) & 255},${n & 255},0)`;
-  if (revealAt === null || revealAt >= 1) return ['interpolate', ['linear'], ['line-progress'], 0, col, 1, col];
-  if (revealAt <= 0) return ['interpolate', ['linear'], ['line-progress'], 0, clear, 1, clear];
-  return ['interpolate', ['linear'], ['line-progress'], 0, col, revealAt, col, Math.min(1, revealAt + 1e-6), clear, 1, clear];
+function fitAll() {
+  map.fitBounds(trackBounds(), { padding: fitPadding(), pitch: 60, bearing: -15, duration: 2200, maxZoom: 16 });
 }
 
-function paintTrack() {
-  if (!map.getLayer('track-line')) return;
-  map.setPaintProperty('track-line', 'line-gradient', gradientOf(trackColor));
-  map.setPaintProperty('track-casing', 'line-gradient', gradientOf('#ffffff'));
+const EMPTY_LINE = { type: 'Feature', geometry: { type: 'LineString', coordinates: [] } };
+
+// Pendant le survol la trace se dessine derrière le cycliste : la partie parcourue est une source à part, mise à jour
+// ~10 fois par seconde (pas à chaque image : retuiler la ligne coûte cher sur téléphone). Au repos : trace complète.
+const TRAIL_CHUNK = 300; // points entre deux mises à jour de la partie validée
+let ri = 0, ci = 0, trailMs = 0, trailOn = false; // ci : dernier point validé dans la source « trail »
+function showTrail(on) {
+  if (on === trailOn || !map.getLayer('trail-line')) return;
+  trailOn = on;
+  for (const id of ['track-casing', 'track-line']) map.setLayoutProperty(id, 'visibility', on ? 'none' : 'visible');
+  for (const id of ['trail-casing', 'trail-line', 'tail-casing', 'tail-line']) map.setLayoutProperty(id, 'visibility', on ? 'visible' : 'none');
 }
 
-// Fraction (0..1) de la trace réelle déjà parcourue au point p : projection sur la trace brute, qui est plus longue
-// que le chemin lissé de la caméra (bruit GPS), donc d / cam.total prenait du retard. Recherche vers l'avant seulement.
-let ri = 0;
-function trackFrac(p) {
+// p : position du cycliste ; null = fin du survol (trace complète). La position est projetée sur la trace brute
+// (plus longue que le chemin lissé de la caméra), vers l'avant seulement.
+function setTrail(p) {
+  if (p === null) { showTrail(false); return; }
+  const now = rec && rec.offline ? rec.vt : performance.now();
+  if (trailOn && now - trailMs < 100) return;
+  trailMs = now;
   const kx = Math.cos(rad(p[1])) * 111320, ky = 110540;
   let best = Infinity, bi = ri, bu = 0;
   for (let i = ri; i < coords.length - 1 && cum[i] - cum[ri] < 3000; i++) {
@@ -607,20 +641,27 @@ function trackFrac(p) {
     if (d2 < best) { best = d2; bi = i; bu = u; }
   }
   ri = bi;
-  return (cum[bi] + bu * (cum[bi + 1] - cum[bi])) / total;
-}
-
-function setReveal(f) {
-  revealAt = f;
-  if (f === null || Math.abs(f - shownAt) > 0.0004) { shownAt = f === null ? -1 : f; paintTrack(); }
+  const lineOf = (a, b) => ({ type: 'Feature', geometry: { type: 'LineString', coordinates: b - a >= 1 ? coords.slice(a, b + 1).map(q => [q[0], q[1]]) : [] } });
+  if (bi < ci) ci = 0;
+  if (bi - ci >= TRAIL_CHUNK) { map.getSource('trail').setData(lineOf(0, bi)); ci = bi; } // gros envoi : rare
+  const tail = coords.slice(ci, bi + 1).map(q => [q[0], q[1]]);
+  if (bu > 0) tail.push([coords[bi][0] + (coords[bi + 1][0] - coords[bi][0]) * bu, coords[bi][1] + (coords[bi + 1][1] - coords[bi][1]) * bu]);
+  map.getSource('tail').setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: tail.length > 1 ? tail : [] } });
+  showTrail(true);
 }
 
 function setTrackStyle(color, width) {
   trackColor = color; trackWidth = width;
   if (map.getLayer('track-line')) {
-    paintTrack();
+    map.setPaintProperty('track-line', 'line-color', color);
     map.setPaintProperty('track-line', 'line-width', width);
     map.setPaintProperty('track-casing', 'line-width', width + 3.5);
+    map.setPaintProperty('trail-line', 'line-color', color);
+    map.setPaintProperty('tail-line', 'line-color', color);
+    map.setPaintProperty('tail-line', 'line-width', width);
+    map.setPaintProperty('tail-casing', 'line-width', width + 3.5);
+    map.setPaintProperty('trail-line', 'line-width', width);
+    map.setPaintProperty('trail-casing', 'line-width', width + 3.5);
   }
   if (map.getLayer('start-dot')) map.setPaintProperty('start-dot', 'circle-stroke-color', color);
 }
@@ -678,7 +719,8 @@ function setMarker(kind) {
 function setBase(satellite) {
   map.setLayoutProperty('sat', 'visibility', satellite ? 'visible' : 'none');
   map.setLayoutProperty('plan', 'visibility', satellite ? 'none' : 'visible');
-  map.setPaintProperty('hillshade', 'hillshade-exaggeration', satellite ? 0.35 : 0.6);
+  map.setLayoutProperty('hillshade', 'visibility', satellite ? 'none' : 'visible');
+  map.setPaintProperty('hillshade', 'hillshade-exaggeration', 0.6);
 }
 
 // ---------- Repère ----------
@@ -806,8 +848,11 @@ function drawHud(g, w, h, s) {
 }
 
 const hudCv = document.getElementById('hud');
+let hudDirty = false; // la surcouche contient du dessin à effacer
 function paintHud() {
-  const dpr = window.devicePixelRatio || 1, w = window.innerWidth, h = window.innerHeight;
+  if (!hudDirty && !shown.size && !hudState) return; // rien à dessiner : on évite de repeindre un canevas plein écran à chaque image
+  hudDirty = !!(shown.size || hudState);
+  const dpr = Math.min(window.devicePixelRatio || 1, 1.5), w = window.innerWidth, h = window.innerHeight;
   if (hudCv.width !== Math.round(w * dpr) || hudCv.height !== Math.round(h * dpr)) {
     hudCv.width = Math.round(w * dpr); hudCv.height = Math.round(h * dpr);
   }
@@ -820,26 +865,48 @@ function paintHud() {
 
 function showHud(st) { hudState = st; paintHud(); }
 
-// Hors survol, les repères de ville restent affichés : on les redessine pour la rotation et quand la carte bouge.
-(function idle() { if (!anim && !rec && shown.size) paintHud(); requestAnimationFrame(idle); })();
+// Hors survol, les noms de ville restent affichés : on les redessine quand la carte bouge.
+map.on('render', () => { if (!anim && !rec && shown.size) paintHud(); });
+
+// Image suivante : en direct (rAF) ou, pendant un enregistrement image par image, on capture l'image courante
+// puis on avance l'horloge virtuelle d'exactement 1/FPS.
+function schedule(stepFn) {
+  if (!(rec && rec.offline)) { anim = requestAnimationFrame(stepFn); return; }
+  anim = 1;
+  rec.capture().then(() => {
+    if (anim && rec && rec.offline) { rec.vt += 1000 / FPS; stepFn(rec.vt); }
+  }, () => { stopFly(true); Bridge.postMessage("verr:Échec de l'encodage vidéo."); });
+}
 
 // Après la dernière position : la carte se recadre sur le parcours, les stats finales zooment, puis on arrête.
 function outro() {
-  const ZOOM = 1400, HOLD = 9000; // HOLD long : si la vidéo est accélérée, la fin reste lisible
+  const ZOOM = 1400, HOLD = OUTRO_HOLD, FIT = 2200; // HOLD long : si la vidéo est accélérée, la fin reste lisible
   const fin = hudFinal();
   let last = null, t = 0;
   cityPins = false;
-  setReveal(null);
-  fitAll();
+  setTrail(null);
+  // en vidéo, le recadrage est interpolé sur l'horloge virtuelle (l'animation de la carte suit l'horloge réelle)
+  let tgt = null;
+  if (rec && rec.offline) {
+    const cz = map.cameraForBounds(trackBounds(), { padding: fitPadding(), bearing: -15, maxZoom: 16 });
+    if (cz) tgt = { c: maplibregl.LngLat.convert(cz.center), z: cz.zoom, p: 60, b: -15,
+      f: { c: map.getCenter(), z: map.getZoom(), p: map.getPitch(), b: map.getBearing() } };
+  }
+  if (!tgt) fitAll();
   const step = (ts) => {
     if (last === null) last = ts;
     t += Math.min(ts - last, 40); last = ts;
+    if (tgt) {
+      const k = Math.min(1, t / FIT), e = k * k * (3 - 2 * k);
+      map.jumpTo({ center: [lerp(tgt.f.c.lng, tgt.c.lng, e), lerp(tgt.f.c.lat, tgt.c.lat, e)], zoom: lerp(tgt.f.z, tgt.z, e),
+        pitch: lerp(tgt.f.p, tgt.p, e), bearing: lerpAngle(tgt.f.b, tgt.b, e) });
+    }
     showHud(Object.assign({}, fin, { final: t / ZOOM }));
     map.triggerRepaint(); // le canvas enregistré doit continuer à recevoir des images
     if (t >= HOLD) { finishFly(false); return; }
-    anim = requestAnimationFrame(step);
+    schedule(step);
   };
-  anim = requestAnimationFrame(step);
+  if (rec && rec.offline) { anim = 1; step(rec.vt); } else anim = requestAnimationFrame(step);
 }
 
 // ---------- Survol 3D ----------
@@ -850,7 +917,16 @@ function startFly(speed, record) {
   if (!coords.length) return;
   stopFly(true);
   map.stop();
-  if (record && !startRec()) { Bridge.postMessage('flyEnd'); return; }
+  if (!record) { runFly(speed, false); return; }
+  const tok = flyTok;
+  startRec().then(ok => {
+    if (tok !== flyTok) { if (rec) { rec.discard = true; rec.stop(); } return; } // arrêté entre-temps
+    if (ok) runFly(speed, true); else Bridge.postMessage('flyEnd');
+  });
+}
+
+function runFly(speed, record) {
+  if (!record) { curRatio = FLY_RATIO; map.setPixelRatio(FLY_RATIO); } // moins de pixels à calculer pendant l'animation (rétabli par stopFly)
 
   // ~5 s par km, entre 25 s et 90 s à x1
   const dur = Math.min(90000, Math.max(25000, (total / 1000) * 5000)) / (speed || 1);
@@ -858,13 +934,14 @@ function startFly(speed, record) {
   const SMOOTH = 320, CSMOOTH = 45, INTRO = record ? 2200 : 1600, TURN_SIDE = 45;         // lissage du cap et du centre (m) ; fondu d'entrée (ms)
   const PITCH = 58, ZOOM = 14.6;                                                         // drone : plus haut, derrière
   let from = { c: map.getCenter(), z: map.getZoom(), p: map.getPitch(), b: map.getBearing() };
+  let fpsN = 0, fpsT = performance.now();
   let last = null, t = 0, tw = 0, brg = null, prevD = 0, cc = null;
   // vidéo : le cycliste attend au départ, vu de côté, pendant que la caméra zoome sur lui, puis il démarre
   const WAIT = record ? 2800 : 0, ZOOMIN = 1900, p0 = pointAt(0, cam), h0 = bearing(p0, pointAt(Math.min(cam.total, look), cam));
   const WAIT_VIEW = { z: 15.8, p: 62, b: (h0 + 270) % 360 };
 
   map.getSource('pins').setData(pinsGeo(true));
-  setReveal(0); ri = 0;
+  ri = 0; ci = 0; trailMs = 0; map.getSource('trail').setData(EMPTY_LINE); setTrail(coords[0]); // la trace n'apparaît qu'au passage du cycliste
 
   const step = (ts) => {
     if (last === null) last = ts;
@@ -880,7 +957,7 @@ function startFly(speed, record) {
       placeDot(p0, 0, 'bikeR');
       if (hudData) hudState = hudAt(0);
       paintHud();
-      anim = requestAnimationFrame(step);
+      schedule(step);
       return;
     }
     if (WAIT && t === 0) from = { c: { lng: p0[0], lat: p0[1] }, z: WAIT_VIEW.z, p: WAIT_VIEW.p, b: WAIT_VIEW.b };
@@ -888,7 +965,7 @@ function startFly(speed, record) {
     if (t >= dur) { if (record && hudData) outro(); else finishFly(); return; }
     const d = (t / dur) * cam.total;
     const p = pointAt(d, cam);
-    setReveal(trackFrac(p));
+    setTrail(p);
     const target = bearing(p, pointAt(Math.min(cam.total, d + look), cam));
     // lissage selon la distance parcourue : même rendu quelle que soit la vitesse ou la fréquence d'images
     brg = brg === null ? target : lerpAngle(brg, target, 1 - Math.exp(-(d - prevD) / SMOOTH));
@@ -910,17 +987,24 @@ function startFly(speed, record) {
     if (record && hudData) hudState = hudAt(t / dur);
     revealCities(p);
     paintHud();
-    anim = requestAnimationFrame(step);
+    if (!(rec && rec.offline)) { // diagnostic : images/s réelles, visibles dans les logs
+      const n = performance.now(); fpsN++;
+      if (n - fpsT > 2000) { console.log('fps ' + Math.round(fpsN * 1000 / (n - fpsT))); fpsN = 0; fpsT = n; }
+    }
+    schedule(step);
   };
-  anim = requestAnimationFrame(step);
+  if (rec && rec.offline) { rec.total = (WAIT + dur + OUTRO_HOLD) * FPS / 1000; anim = 1; step(rec.vt); }
+  else anim = requestAnimationFrame(step);
 }
 
 // keepCities : fin normale du survol, les villes traversées restent affichées sur la carte dézoomée
 function stopFly(silent, keepCities = false) {
+  flyTok++;
+  if (curRatio !== NAV_RATIO) { curRatio = NAV_RATIO; map.setPixelRatio(NAV_RATIO); }
   if (anim) { cancelAnimationFrame(anim); anim = null; }
   if (rec) { rec.discard = true; if (rec.state !== 'inactive') rec.stop(); }
   hudState = null; if (!keepCities) { shown = new Map(); cityPins = true; } paintHud();
-  setReveal(null);
+  setTrail(null);
   if (coords.length) {
     map.getSource('pins')?.setData(pinsGeo(false));
     placeDot(coords[0], 0);
@@ -933,13 +1017,116 @@ function finishFly(fit = true) {
   rec = null; // détaché pour que stopFly ne l'annule pas
   cityPins = false;
   stopFly(true, true);
-  if (r) { Bridge.postMessage('encoding'); r.stop(); }
+  if (r) { Bridge.postMessage('encoding'); if (r.offline) r.finish(); else r.stop(); }
   else if (window.Bridge) Bridge.postMessage('flyEnd');
   if (fit) fitAll();
 }
 
 // ---------- Enregistrement vidéo ----------
-function startRec() {
+// Envoie la vidéo à Flutter par morceaux base64.
+function sendVideo(blob, ext) {
+  const fr = new FileReader();
+  fr.onerror = () => Bridge.postMessage('verr:Lecture de la vidéo impossible.');
+  fr.onload = () => {
+    const b64 = fr.result.split(',')[1], CH = 1 << 19; // multiple de 4 : chaque morceau se décode seul
+    for (let i = 0; i < b64.length; i += CH) Bridge.postMessage('vchunk:' + b64.slice(i, i + CH));
+    Bridge.postMessage('vend:' + ext);
+  };
+  fr.readAsDataURL(blob);
+}
+
+// Attend que la carte soit prête (tuiles et position du cycliste à jour) puis copie son canevas, au moment du rendu
+// (un canevas WebGL n'est lisible que pendant le rendu). Plus léger que d'attendre l'événement « idle » (fondus,
+// placement des symboles) et une seule copie par image au lieu d'une par rendu.
+function settle(copy, stat) {
+  return new Promise(res => {
+    const t0 = performance.now();
+    let renders = 0;
+    const ready = () => map.areTilesLoaded() && map.isSourceLoaded('dot') && (!trailOn || map.isSourceLoaded('tail'));
+    const done = () => { clearTimeout(timer); map.off('render', check); stat(renders, performance.now() - t0); res(); };
+    const check = () => {
+      renders++;
+      if (ready() || performance.now() - t0 > 3000) { copy(); done(); }
+    };
+    const timer = setTimeout(done, 6000); // sécurité : aucun rendu n'est venu
+    map.on('render', check);
+    map.triggerRepaint();
+  });
+}
+
+// Enregistrement image par image (WebCodecs + mp4-muxer) : horloge virtuelle à FPS fixe, donc ni saccades de rendu
+// ni durée fausse dans le lecteur ; MP4 H.264 classique (index en tête de fichier). null si la WebView ne sait pas.
+async function startOfflineRec() {
+  if (!window.VideoEncoder || !window.VideoFrame || !window.Mp4Muxer) return null;
+  const src = map.getCanvas();
+  for (const lim of [1920, 1280]) {
+    const sc = Math.min(1, lim / Math.max(src.width, src.height));
+    const w = Math.floor(src.width * sc / 2) * 2, h = Math.floor(src.height * sc / 2) * 2; // H.264 : dimensions paires
+    for (const codec of ['avc1.640033', 'avc1.64002a', 'avc1.4d0028']) {
+      const cfg = { codec, width: w, height: h, bitrate: 10e6, framerate: FPS };
+      let ok = false;
+      try { ok = (await VideoEncoder.isConfigSupported(cfg)).supported; } catch (_) { /* configuration suivante */ }
+      if (ok) return makeOfflineRec(src, w, h, cfg);
+    }
+  }
+  return null;
+}
+
+function makeOfflineRec(src, w, h, cfg) {
+  const out = document.createElement('canvas'); out.width = w; out.height = h;
+  const g = out.getContext('2d');
+  const muxer = new Mp4Muxer.Muxer({ target: new Mp4Muxer.ArrayBufferTarget(),
+    video: { codec: 'avc', width: w, height: h }, fastStart: 'in-memory' });
+  let error = null;
+  const enc = new VideoEncoder({ output: (c, m) => muxer.addVideoChunk(c, m), error: e => { error = e; } });
+  enc.configure(cfg);
+  const copy = () => g.drawImage(src, 0, 0, w, h);
+  const r = {
+    offline: true, state: 'recording', discard: false, vt: 0, n: 0, total: 0, tSettle: 0, nRender: 0, tLog: performance.now(),
+    stop() {
+      r.state = 'inactive';
+      try { enc.close(); } catch (_) { /* déjà fermé */ }
+      if (rec === r) rec = null;
+    },
+    async capture() {
+      const t0 = performance.now();
+      await settle(copy, (n, ms) => { r.nRender += n; });
+      r.tSettle += performance.now() - t0;
+      if (r.state === 'inactive') return;
+      if (shown.size) drawCities(g, w / window.innerWidth);
+      if (hudState) drawHud(g, w, h, hudState);
+      const f = new VideoFrame(out, { timestamp: Math.round(r.n * 1e6 / FPS) });
+      enc.encode(f, { keyFrame: r.n % (FPS * 2) === 0 });
+      f.close(); r.n++;
+      while (enc.encodeQueueSize > 8 && !error) await new Promise(ok => setTimeout(ok, 4));
+      if (error) throw error;
+      if (r.n % 60 === 0) { // diagnostic : ms moyennes par image (attente de la carte / total)
+        const now = performance.now();
+        console.log('rec ' + r.n + ' images : attente carte ' + Math.round(r.tSettle / 60) + ' ms, total ' + Math.round((now - r.tLog) / 60) + ' ms, rendus/image ' + (r.nRender / 60).toFixed(1));
+        r.tSettle = 0; r.nRender = 0; r.tLog = now;
+      }
+      if (r.n % 10 === 0 && r.total) Bridge.postMessage('vprog:' + Math.min(99, Math.round(100 * r.n / r.total)));
+    },
+    async finish() {
+      r.state = 'inactive';
+      try {
+        await enc.flush(); muxer.finalize(); enc.close();
+        console.log('rec fin : ' + r.n + ' images, ' + Math.round(r.vt) + ' ms virtuelles');
+        sendVideo(new Blob([muxer.target.buffer], { type: 'video/mp4' }), 'mp4');
+      } catch (e) { Bridge.postMessage("verr:Échec de l'encodage vidéo."); }
+    }
+  };
+  return r;
+}
+
+async function startRec() {
+  const off = await startOfflineRec();
+  if (off) { rec = off; return true; }
+  return startRecLive();
+}
+
+// Repli : MediaRecorder en direct (durée parfois mal indiquée par le lecteur, rendu dépendant de la fluidité).
+function startRecLive() {
   const types = ['video/mp4;codecs=avc1', 'video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'];
   const mime = window.MediaRecorder && types.find(t => MediaRecorder.isTypeSupported(t));
   if (!mime) { Bridge.postMessage('verr:Enregistrement vidéo non supporté par cette WebView.'); return false; }
@@ -964,14 +1151,7 @@ function startRec() {
     if (rec === r) rec = null;
     if (r.discard) return;
     if (!chunks.length) { Bridge.postMessage("verr:La vidéo est vide."); return; }
-    const fr = new FileReader();
-    fr.onerror = () => Bridge.postMessage('verr:Lecture de la vidéo impossible.');
-    fr.onload = () => {
-      const b64 = fr.result.split(',')[1], CH = 1 << 19; // multiple de 4 : chaque morceau se décode seul
-      for (let i = 0; i < b64.length; i += CH) Bridge.postMessage('vchunk:' + b64.slice(i, i + CH));
-      Bridge.postMessage('vend:' + (mime.includes('mp4') ? 'mp4' : 'webm'));
-    };
-    fr.readAsDataURL(new Blob(chunks, { type: mime }));
+    sendVideo(new Blob(chunks, { type: mime }), mime.includes('mp4') ? 'mp4' : 'webm');
   };
   r.discard = false;
   rec = r;
